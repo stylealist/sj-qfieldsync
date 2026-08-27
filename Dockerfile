@@ -40,4 +40,4 @@ RUN mkdir -p /app/qfield
 VOLUME ["/app/qfield"]
 
 # 8. 실행 명령
-CMD ["python", "sync_watcher.py"]
+CMD ["python", "qfield_data_sync.py"]
