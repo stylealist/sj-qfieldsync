@@ -1,28 +1,13 @@
 """
 QFieldCloud -> PostGIS 실시간 동기화 엔진
-(own_id/src_key 이원화 UPSERT + 재사용 없는 안정적 total_id 생성 풀버전)
-
-⚠️ 왜 own_id/src_key를 분리했는가
-   GPKG의 fid(feature id)는 SQLite rowid 특성이나 QFieldCloud의 패키징(export)
-   방식에 따라 "행이 삭제되면 뒤 행의 fid가 앞으로 당겨지는" 현상이 발생할 수 있다.
-   즉 소스의 fid는 절대 재사용/재배치되지 않는다는 보장이 없다.
-   그래서 우리 DB의 join-key(total_id)는 fid를 직접 쓰지 않고, own_id(BIGSERIAL)라는
-   "우리가 발급하고 절대 재사용하지 않는 내부 키"를 기준으로 만든다.
+(qfield_info 기반 컬럼 필터링 + own_id/src_key 이원화 UPSERT 풀버전)
 
 기능
 1) QFieldCloud의 전체 프로젝트를 주기적으로 스캔
 2) 신규/변경된 프로젝트만 SDK로 다운로드
-3) 다운로드된 GPKG 레이어들을 PostGIS 물리 테이블로 UPSERT 적재 (+ 음성 STT 변환)
-   - own_id(BIGSERIAL, 절대 재사용 안 됨)를 진짜 PRIMARY KEY로 사용.
-   - src_key(소스 fid)는 "현재 활성(use_yn='y') 행 안에서만" unique하도록
-     partial unique index로 매칭에 사용.
-   - 소스에서 어떤 fid가 사라지면 해당 행은 물리 삭제하지 않고 use_yn='n'만 변경.
-     이후 소스에서 같은 fid 값이 재사용되어 나타나도, 그 값은 이미 비활성 상태라
-     기존 행과 매칭되지 않고 새로운 own_id(=max+1)로 신규 삽입된다.
-     -> "2번 삭제 시 3번의 키가 2번으로 바뀌는" 문제가 발생하지 않는다.
+3) qfield.qfield_info 테이블의 column_list와 일치하는 유효 레이어만 PostGIS 물리 테이블로 UPSERT 적재 (+ 음성 STT 변환)
 4) QFieldCloud에서 삭제된 프로젝트는 물리 테이블 소프트 삭제(use_yn='n') 처리
-5) own_id를 기반으로 직관적인 고유 Key(FACIL_T{idx}_{own_id})를 제공하는
-   qfield.facility_total_view 자동 생성/갱신
+5) own_id를 기반으로 직관적인 고유 Key(FACIL_T{idx}_{own_id})를 제공하는 qfield.facility_total_view 자동 생성/갱신
 """
 
 import os
@@ -129,6 +114,30 @@ def build_audio_cache(project_path):
     return cache
 
 
+def get_target_columns(qfield_type: str = "facility") -> list:
+    """
+    qfield.qfield_info 테이블에서 대상 qfield_type의 column_list 배열을 조회
+    """
+    conn = None
+    target_columns = []
+    try:
+        conn = get_data_conn()
+        cur = conn.cursor()
+        cur.execute(
+            f"SELECT column_list FROM {TARGET_SCHEMA}.qfield_info WHERE qfield_type = %s LIMIT 1",
+            (qfield_type,)
+        )
+        row = cur.fetchone()
+        if row and row[0]:
+            target_columns = list(row[0])
+    except Exception as e:
+        log(f"⚠️ qfield_info 조회 실패 ({qfield_type}): {e}")
+    finally:
+        if conn:
+            conn.close()
+    return target_columns
+
+
 # ============================================================
 # 3. 권한 부여 및 데이터 적재
 # ============================================================
@@ -194,32 +203,15 @@ def _parse_timestamp(val):
     return None
 
 
-def save_gdf_direct(gdf, table_name, schema, project_path):
+def save_gdf_direct(gdf, table_name, schema, project_path, allowed_columns=None):
     """
-    GeoDataFrame을 물리 테이블에 UPSERT 적재.
-
-    ⚠️ 핵심 설계: PK를 이원화한다.
-      - own_id (BIGSERIAL): 우리 DB가 발급하는 진짜 PK. 절대 재사용되지 않는다.
-        total_id/total_seq는 이 값을 기준으로 만든다.
-      - src_key (TEXT): 소스(GPKG)의 fid. "현재 활성 행(use_yn='y') 안에서만"
-        유일하도록 partial unique index를 걸어 매칭(UPSERT)에만 사용한다.
-
-    동작:
-      - 활성 행 중 같은 src_key가 있으면 -> UPDATE (own_id 유지, 내용만 갱신)
-      - 활성 행 중 같은 src_key가 없으면 -> INSERT (own_id는 자동으로 max+1)
-        · 소스가 fid를 재사용/재배치해도, 이미 비활성화된 src_key는 매칭 대상이
-          아니므로 예전 행을 덮어쓰지 않고 항상 새 own_id로 들어간다.
-      - 이번 사이클에 없는 기존 활성 src_key -> use_yn='n' 소프트 삭제
-        (물리 삭제 안 함 -> own_id/total_id는 영구 보존, 웹사이트 join 안전)
+    GeoDataFrame을 물리 테이블에 UPSERT 적재 (qfield_info 컬럼 기준 필터링 적용)
     """
     log(f"💾 [DB 저장 시작] {table_name}")
     conn = None
     try:
         if "fid" not in gdf.columns:
-            raise ValueError(
-                "GeoDataFrame에 소스 fid 컬럼이 없습니다. "
-                "gpd.read_file(..., fid_as_index=True) 로 읽었는지 확인하세요."
-            )
+            raise ValueError("GeoDataFrame에 소스 fid 컬럼이 없습니다.")
 
         conn = get_data_conn()
         cur = conn.cursor()
@@ -227,21 +219,24 @@ def save_gdf_direct(gdf, table_name, schema, project_path):
         is_geo = isinstance(gdf, gpd.GeoDataFrame) and gdf.geometry is not None
         geom_col = gdf.geometry.name if is_geo else None
 
-        reserved_cols = {"fid", "own_id", "src_key", "seq", "platform_type", "use_yn", "reg_date", "update_at"}
-        if geom_col:
-            reserved_cols.add(geom_col.lower())
-
-        source_cols = [c for c in gdf.columns if c.lower() not in reserved_cols]
+        # qfield_info에 정의된 allowed_columns만 필터링 (없으면 기존 방식대로 전체)
+        if allowed_columns:
+            source_cols = [c for c in allowed_columns if c in gdf.columns]
+        else:
+            reserved_cols = {"fid", "own_id", "src_key", "seq", "platform_type", "use_yn", "reg_date", "update_at"}
+            if geom_col:
+                reserved_cols.add(geom_col.lower())
+            source_cols = [c for c in gdf.columns if c.lower() not in reserved_cols]
 
         final_cols = []
         for c in source_cols:
             final_cols.append(c)
-            if "record" in c.lower() or "audio" in c.lower():
+            if "record" in c.lower() or "audio" in c.lower() or "memo" in c.lower():
                 final_cols.append(c + "_txt")
 
         date_cols = {c for c in final_cols if "date" in c.lower() or "time" in c.lower() or "at" in c.lower()}
 
-        # 1. 테이블 존재 여부 확인 (더 이상 DROP 하지 않음)
+        # 1. 테이블 생성 및 컬럼 보강
         cur.execute(
             """
             SELECT column_name FROM information_schema.columns
@@ -269,9 +264,6 @@ def save_gdf_direct(gdf, table_name, schema, project_path):
 
             cur.execute(f'CREATE TABLE {schema}."{table_name}" ({", ".join(col_defs)})')
 
-            # 활성 행 안에서만 src_key가 유일하도록 partial unique index 생성.
-            # -> 소프트 삭제(use_yn='n')된 src_key는 더 이상 매칭 대상이 아니게 되어
-            #    이후 재사용되어도 새로운 own_id로 들어간다.
             active_uq_name = f"ux_{table_name}_srckey_active"
             cur.execute(
                 f'CREATE UNIQUE INDEX "{active_uq_name}" '
@@ -287,7 +279,6 @@ def save_gdf_direct(gdf, table_name, schema, project_path):
 
             conn.commit()
         else:
-            # 스키마가 진화한 경우(신규 필드 추가 등) 컬럼만 보강한다.
             for col in final_cols:
                 if col not in existing_cols:
                     col_type = "TIMESTAMP" if col in date_cols else "TEXT"
@@ -302,7 +293,7 @@ def save_gdf_direct(gdf, table_name, schema, project_path):
 
         audio_cache = build_audio_cache(project_path)
 
-        # 2. UPSERT 컬럼 및 Placeholders 구성 (src_key 기준, 활성 행에만 매칭)
+        # 2. UPSERT 쿼리 생성
         insert_cols = ["src_key"] + final_cols + ["use_yn"]
         if is_geo:
             insert_cols.append(geom_col)
@@ -322,8 +313,6 @@ def save_gdf_direct(gdf, table_name, schema, project_path):
         )
         update_set += ', "update_at" = NOW()'
 
-        # ON CONFLICT ... WHERE use_yn='y' 는 위에서 만든 partial unique index를
-        # arbiter로 지정하는 것과 동일 -> 비활성 행과는 절대 충돌(=덮어쓰기)하지 않는다.
         sql = (
             f'INSERT INTO {schema}."{table_name}" '
             f'({quoted_insert_cols}) '
@@ -367,10 +356,7 @@ def save_gdf_direct(gdf, table_name, schema, project_path):
 
         execute_batch(cur, sql, batch_data, page_size=1000)
 
-        # 4. 이번 사이클에 없는 기존 활성 src_key는 삭제된 피처로 간주하여 소프트 삭제.
-        #    own_id/행 자체는 물리 삭제하지 않으므로 total_id 참조 무결성이 깨지지 않고,
-        #    이 src_key가 나중에 재사용되어도 위 partial unique index 덕분에
-        #    이 행과는 다시 매칭되지 않는다(항상 새 own_id로 신규 삽입됨).
+        # 4. 소스에서 삭제된 활성 src_key 소프트 삭제
         if current_keys:
             cur.execute(
                 f'UPDATE {schema}."{table_name}" '
@@ -398,14 +384,7 @@ def save_gdf_direct(gdf, table_name, schema, project_path):
 def update_facility_total_view():
     """
     TARGET_SCHEMA 내의 모든 물리 테이블을 스캔하여
-    own_id(우리 DB가 발급한, 절대 재사용되지 않는 내부 PK)를 바인딩한
-    안정적인 고유 Key(FACIL_T{idx}_{own_id})가 포함된
-    facility_total_view를 생성/갱신합니다.
-
-    own_id는 각 물리 테이블의 진짜 PRIMARY KEY(BIGSERIAL)이며, 소스(fid)가
-    삭제/재배치/재사용되어도 own_id 자체는 절대 바뀌거나 재사용되지 않으므로
-    total_id는 항상 동일한 레코드만을 가리킨다.
-    (삭제된 피처는 물리 삭제 대신 use_yn='n' 처리되어 행이 유지된다.)
+    own_id 기반 안정적인 고유 Key(FACIL_T{idx}_{own_id})가 포함된 facility_total_view 생성/갱신
     """
     log("📊 [facility_total_view 갱신 시작]")
     conn = None
@@ -414,10 +393,10 @@ def update_facility_total_view():
         conn.autocommit = True
         cur = conn.cursor()
 
-        # 1. qfield 스키마 내 모든 물리 테이블 목록 조회
+        # 1. qfield 스키마 내 물리 테이블 목록 조회 (qfield_info 메타 테이블 제외)
         cur.execute("""
             SELECT table_name FROM information_schema.tables
-            WHERE table_schema = %s AND table_type = 'BASE TABLE'
+            WHERE table_schema = %s AND table_type = 'BASE TABLE' AND table_name != 'qfield_info'
             ORDER BY table_name
         """, (TARGET_SCHEMA,))
         tables = [r[0] for r in cur.fetchall()]
@@ -440,7 +419,7 @@ def update_facility_total_view():
             """, (TARGET_SCHEMA, t_name))
             cols = {r[0].lower(): (r[0], r[1]) for r in cur.fetchall()}
 
-            if "project_id" in cols or "geometry" in cols or "geom" in cols:
+            if "project_id" in cols or "geometry" in cols or "geom" in cols or "own_id" in cols:
                 table_col_map[t_name] = cols
                 valid_tables.append(t_name)
                 for c_lower, (c_orig, _) in cols.items():
@@ -458,13 +437,8 @@ def update_facility_total_view():
         union_parts = []
         for idx, t_name in enumerate(valid_tables, start=1):
             t_cols = table_col_map[t_name]
-
-            # 테이블별 10,000,000 단위 프리픽스
             table_prefix_num = idx * 10000000
 
-            # 💡 [핵심] own_id(우리 DB가 발급한, 절대 재사용되지 않는 PK)를
-            #    total_id에 직접 바인딩. 소스 fid는 재배치/재사용될 수 있어
-            #    매칭에만 쓰고, 외부에 노출되는 키(total_id)는 own_id로만 만든다.
             if "own_id" in t_cols:
                 own_id_col = t_cols["own_id"][0]
                 origin_id_val = f't."{own_id_col}"::BIGINT'
@@ -492,7 +466,7 @@ def update_facility_total_view():
             reg_date_val = f't."{t_cols["reg_date"][0]}"' if "reg_date" in t_cols else "NULL::TIMESTAMP"
             update_at_val = f't."{t_cols["update_at"][0]}"' if "update_at" in t_cols else "NULL::TIMESTAMP"
 
-            # 사용자 정의 컬럼 매핑 (없으면 NULL)
+            # 사용자 정의 속성 매핑 (없으면 NULL)
             custom_selects = []
             for col in sorted_custom_cols:
                 col_lower = col.lower()
@@ -549,9 +523,7 @@ CREATE OR REPLACE VIEW {TARGET_SCHEMA}.facility_total_view AS
 
 def _read_gpkg_layer_with_fid(gpkg_path, layer_name):
     """
-    GPKG 레이어를 읽으면서 원본 feature id(fid)를 'fid' 컬럼으로 보존한다.
-    fid는 GeoPackage 표준상 안정적인 식별자로, QField/QGIS에서 기존 피처를
-    수정해도 값이 바뀌지 않고, 삭제된 fid는 일반적으로 재사용되지 않는다.
+    GPKG 레이어를 읽으면서 원본 feature id(fid)를 'fid' 컬럼으로 보존
     """
     try:
         gdf = gpd.read_file(gpkg_path, layer=layer_name, fid_as_index=True)
@@ -559,22 +531,16 @@ def _read_gpkg_layer_with_fid(gpkg_path, layer_name):
         if "index" in gdf.columns and "fid" not in gdf.columns:
             gdf = gdf.rename(columns={"index": "fid"})
     except TypeError:
-        # geopandas/pyogrio 버전이 fid_as_index를 지원하지 않는 경우 fallback
         gdf = gpd.read_file(gpkg_path, layer=layer_name)
         if "fid" not in gdf.columns:
             raise ValueError(
-                f"'{layer_name}' 레이어에서 안정적인 fid를 확보할 수 없습니다. "
-                "geopandas/pyogrio 버전을 업그레이드하세요."
+                f"'{layer_name}' 레이어에서 fid를 확보할 수 없습니다."
             )
     return gdf
 
 
 def _slugify_table_part(text_val: str, maxlen: int = 40) -> str:
-    """
-    테이블명 조각을 안전하고 '고정된' 형태로 변환한다.
-    (파일명+레이어명) 기반이므로 다른 레이어가 이번 사이클에 비어 있어도
-    이 레이어의 테이블명은 절대 흔들리지 않는다.
-    """
+    """테이블명 조각을 안전하고 고정된 형태로 변환"""
     slug = re.sub(r"[^0-9a-zA-Z_]+", "_", text_val.strip().lower()).strip("_")
     if not slug:
         slug = "layer"
@@ -585,12 +551,7 @@ def _slugify_table_part(text_val: str, maxlen: int = 40) -> str:
 
 
 def soft_delete_all_active(table_name, schema):
-    """
-    레이어의 모든 피처가 삭제되어 이번 사이클에 gdf가 비어있는 경우,
-    (기존 테이블이 있다면) 그 테이블의 활성 행 전체를 소프트 삭제 처리한다.
-    이렇게 해야 '레이어 전체 삭제'도 실제로 반영되고, 다른 레이어가 이 테이블
-    자리를 대신 차지하는 일도 없다(테이블명이 고정이므로).
-    """
+    """레이어 전체 삭제 시 활성 행 소프트 삭제"""
     conn = None
     try:
         conn = get_data_conn()
@@ -604,7 +565,7 @@ def soft_delete_all_active(table_name, schema):
             (schema, table_name),
         )
         if not cur.fetchone():
-            return  # 이 레이어로 저장된 적 자체가 없으면 할 일 없음
+            return
 
         cur.execute(
             f'UPDATE {schema}."{table_name}" SET use_yn = \'n\', update_at = NOW() WHERE use_yn = \'y\''
@@ -616,8 +577,12 @@ def soft_delete_all_active(table_name, schema):
     finally:
         if conn:
             conn.close()
+
+
 def process_gpkg_to_db(project_id, project_path, project_name, owner):
-    """프로젝트 폴더 내 모든 GPKG 레이어를 읽어 PostGIS 테이블로 적재"""
+    """
+    프로젝트 폴더 내 GPKG 레이어 중 qfield_info의 column_list에 매칭되는 레이어만 적재
+    """
     log(f"🔍 [분석 시작] {project_name}")
     short_id = project_id[:13]
     clean_owner = owner.lower().replace(" ", "_").replace("-", "_")
@@ -628,6 +593,10 @@ def process_gpkg_to_db(project_id, project_path, project_name, owner):
     gpkg_files = [f for f in os.listdir(project_path) if f.endswith(".gpkg")]
     if not gpkg_files:
         return False
+
+    # 💡 qfield.qfield_info에서 facility의 column_list 조회
+    target_columns = get_target_columns("facility")
+    target_col_set = {c.lower() for c in target_columns}
 
     any_saved = False
 
@@ -645,23 +614,24 @@ def process_gpkg_to_db(project_id, project_path, project_name, owner):
             if layer_name.lower() in {"layer_styles", "geopackage_contents", "gpkg_contents"}:
                 continue
 
-            # 💡 [핵심 수정] 테이블명을 "몇 번째로 성공 처리됐는가"(순번)가 아니라
-            #    (파일명+레이어명) 기반의 고정된 값으로 결정한다.
-            #    예전 방식은 어떤 레이어가 이번 사이클에 완전히 비어버리면(전체 삭제 등)
-            #    그 레이어를 건너뛰면서 뒤에 오는 다른 레이어가 그 순번(=테이블)을
-            #    대신 차지했고, 그 결과 서로 무관한 레이어의 기존 데이터가
-            #    "이번 사이클에 없는 src_key"로 오인되어 잘못 소프트 삭제되는 버그가 있었다.
-            #    고정 테이블명을 쓰면 다른 레이어의 상태와 무관하게 항상 같은 테이블에만
-            #    저장되므로 이 문제가 원천적으로 사라진다.
             layer_key = _slugify_table_part(f"{file_stem}_{layer_name}")
             table_name = f"{clean_owner}_{short_id}_{layer_key}"
 
             try:
                 gdf = _read_gpkg_layer_with_fid(gpkg_path, layer_name)
 
+                # 💡 [핵심 필터링]: qfield_info의 column_list와 레이어 컬럼 비교
+                if target_col_set:
+                    layer_cols_set = {c.lower() for c in gdf.columns}
+                    # target_column 중 레이어에 존재하는 컬럼 개수 계산
+                    intersection = target_col_set.intersection(layer_cols_set)
+                    
+                    # 기준 컬럼이 1개도 일치하지 않는 무관한 레이어는 스킵
+                    if not intersection:
+                        log(f"⏭️ [스킵] '{layer_name}' 레이어는 qfield_info 컬럼 정의와 일치하지 않음")
+                        continue
+
                 if gdf.empty:
-                    # 레이어의 모든 피처가 삭제된 경우: 기존 테이블이 있다면
-                    # 활성 행을 전부 소프트 삭제 처리해서 삭제를 실제로 반영한다.
                     soft_delete_all_active(table_name, TARGET_SCHEMA)
                     continue
 
@@ -675,7 +645,8 @@ def process_gpkg_to_db(project_id, project_path, project_name, owner):
                     owner=owner
                 )
 
-                save_gdf_direct(gdf, table_name, TARGET_SCHEMA, project_path)
+                # qfield_info에 정의된 컬럼 위주로 저장
+                save_gdf_direct(gdf, table_name, TARGET_SCHEMA, project_path, allowed_columns=target_columns)
                 any_saved = True
 
             except Exception as e:
@@ -806,7 +777,7 @@ def cleanup_deleted_projects(current_project_ids):
 
         cur.execute("""
             SELECT table_name FROM information_schema.tables
-            WHERE table_schema = %s AND table_type = 'BASE TABLE'
+            WHERE table_schema = %s AND table_type = 'BASE TABLE' AND table_name != 'qfield_info'
         """, (TARGET_SCHEMA,))
         tables = [r[0] for r in cur.fetchall()]
 
@@ -855,9 +826,9 @@ def cleanup_deleted_projects(current_project_ids):
     return deleted_any
 
 
-# =============================================================
+# ============================================================
 # 7. 메인 루프
-# =============================================================
+# ============================================================
 
 def main():
     last_jobs_cache = {}
