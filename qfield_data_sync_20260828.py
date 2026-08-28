@@ -6,10 +6,8 @@ QFieldCloud -> PostGIS 실시간 동기화 엔진
 1) QFieldCloud의 전체 프로젝트를 주기적으로 스캔
 2) 신규/변경된 프로젝트만 SDK로 다운로드
 3) qfield.qfield_info 테이블의 column_list와 일치하는 유효 레이어만 PostGIS 물리 테이블로 UPSERT 적재 (+ 음성 STT 변환)
-4) QFieldCloud에서 삭제된 프로젝트는 물리 테이블 데이터를 facility_deleted_archive로 이관(use_yn='n') 후 원본 테이블 DROP 처리
-   (이관 시점의 total_seq/total_id를 그대로 고정 보존하여 삭제 전/후 값이 절대 바뀌지 않음)
+4) QFieldCloud에서 삭제된 프로젝트는 물리 테이블 소프트 삭제(use_yn='n') 처리
 5) own_id를 기반으로 직관적인 고유 Key(FACIL_T{idx}_{own_id})를 제공하는 qfield.facility_total_view 자동 생성/갱신
-   (테이블별 idx는 table_seq_registry에 영구 고정되어 테이블 추가/삭제와 무관하게 유지됨)
 """
 
 import os
@@ -24,7 +22,7 @@ import geopandas as gpd
 import pandas as pd
 import psycopg2
 import psycopg2.extras
-from psycopg2.extras import execute_batch, execute_values
+from psycopg2.extras import execute_batch
 from shapely.wkb import dumps as wkb_dumps
 from sqlalchemy import URL, create_engine, text
 from qfieldcloud_sdk import sdk
@@ -74,9 +72,6 @@ TARGET_SCHEMA = "qfield"
 
 # --- 감시 주기(초) ---
 CHECK_INTERVAL = 30
-
-# --- 시스템 관리용 테이블 (일반 물리 테이블 스캔에서 제외) ---
-SYSTEM_TABLES = ("qfield_info", "facility_deleted_archive", "table_seq_registry")
 
 
 def log(msg: str):
@@ -390,11 +385,6 @@ def update_facility_total_view():
     """
     TARGET_SCHEMA 내의 모든 물리 테이블을 스캔하여
     own_id 기반 안정적인 고유 Key(FACIL_T{idx}_{own_id})가 포함된 facility_total_view 생성/갱신
-    + 삭제된 프로젝트의 아카이브 데이터(facility_deleted_archive)도 use_yn='n'으로 포함
-
-    ⚠️ 활성 테이블의 idx는 table_seq_registry에 영구 고정되어 테이블 추가/삭제와 무관하게 유지되고,
-       archive로 이관된 데이터는 이관 시점에 저장해둔 orig_total_seq/orig_total_id를 그대로 사용하므로
-       "삭제 전/후로 total_seq, total_id가 절대 바뀌지 않는다."
     """
     log("📊 [facility_total_view 갱신 시작]")
     conn = None
@@ -403,23 +393,15 @@ def update_facility_total_view():
         conn.autocommit = True
         cur = conn.cursor()
 
-        # 1. qfield 스키마 내 물리 테이블 목록 조회 (시스템 테이블 제외)
+        # 1. qfield 스키마 내 물리 테이블 목록 조회 (qfield_info 메타 테이블 제외)
         cur.execute("""
             SELECT table_name FROM information_schema.tables
-            WHERE table_schema = %s AND table_type = 'BASE TABLE'
-              AND table_name NOT IN %s
+            WHERE table_schema = %s AND table_type = 'BASE TABLE' AND table_name != 'qfield_info'
             ORDER BY table_name
-        """, (TARGET_SCHEMA, SYSTEM_TABLES))
+        """, (TARGET_SCHEMA,))
         tables = [r[0] for r in cur.fetchall()]
 
-        # 아카이브 테이블 존재 여부 확인 (없으면 아직 프로젝트 삭제 이력이 없는 것)
-        cur.execute("""
-            SELECT 1 FROM information_schema.tables
-            WHERE table_schema = %s AND table_name = 'facility_deleted_archive'
-        """, (TARGET_SCHEMA,))
-        archive_exists = bool(cur.fetchone())
-
-        if not tables and not archive_exists:
+        if not tables:
             log("⚠️ [뷰 생성 스킵] 스키마 내에 물리 테이블이 존재하지 않습니다.")
             cur.execute(f"DROP VIEW IF EXISTS {TARGET_SCHEMA}.facility_total_view CASCADE")
             return
@@ -444,7 +426,7 @@ def update_facility_total_view():
                     if c_lower not in system_cols:
                         all_unique_cols.add(c_orig)
 
-        if not valid_tables and not archive_exists:
+        if not valid_tables:
             log("⚠️ [뷰 생성 스킵] 동기화 대상 물리 테이블이 없습니다.")
             return
 
@@ -452,13 +434,8 @@ def update_facility_total_view():
         sorted_custom_cols = sorted(list(all_unique_cols))
 
         # 4. 각 물리 테이블별 SELECT 쿼리문 조합
-        # idx는 매번 스캔 순서가 아니라 table_seq_registry에 영구 고정된 값을 사용
-        # (테이블이 삭제/추가되어도 기존 테이블들의 total_seq/total_id가 절대 바뀌지 않음)
-        table_idx_map = ensure_table_idx_registry(cur, valid_tables)
-
         union_parts = []
-        for t_name in valid_tables:
-            idx = table_idx_map[t_name]
+        for idx, t_name in enumerate(valid_tables, start=1):
             t_cols = table_col_map[t_name]
             table_prefix_num = idx * 10000000
 
@@ -523,49 +500,7 @@ def update_facility_total_view():
     """
             union_parts.append(part)
 
-        # 5. 삭제된 프로젝트의 아카이브 데이터도 use_yn='n'으로 뷰에 포함
-        # 삭제 전에 저장해둔 orig_total_seq/orig_total_id를 그대로 사용 -> 삭제 전/후 값이 절대 바뀌지 않음
-        # (혹시 orig_total_seq가 없는 예전 레코드는 archive_prefix 기반 값으로 폴백)
-        if archive_exists:
-            archive_prefix = 10 ** 15  # 폴백용 여유 구간
-
-            archive_custom_selects = []
-            for col in sorted_custom_cols:
-                col_lower = col.lower()
-                if col_lower.endswith("date") or col_lower.endswith("time") or col_lower.endswith("at"):
-                    archive_custom_selects.append(
-                        f"NULLIF(a.attrs->>'{col}', '')::TIMESTAMP AS \"{col}\""
-                    )
-                else:
-                    archive_custom_selects.append(f"a.attrs->>'{col}' AS \"{col}\"")
-            archive_custom_str = ",\n        ".join(archive_custom_selects)
-            archive_custom_line = f"{archive_custom_str}," if archive_custom_str else ""
-
-            archive_part = f"""
-    SELECT
-        COALESCE(a.orig_total_seq, ({archive_prefix} + a.id))::BIGINT AS total_seq,
-        COALESCE(a.orig_total_id, 'FACIL_ARCH_' || a.id::TEXT) AS total_id,
-        a.own_id AS origin_id,
-        a.src_key AS source_fid,
-        a.source_table AS source_table,
-        a.project_id AS project_id,
-        a.project_name AS project_name,
-        a.owner AS owner,
-        {archive_custom_line}
-        a.use_yn AS use_yn,
-        a.reg_date AS reg_date,
-        a.update_at AS update_at,
-        a.geom AS geom
-    FROM {TARGET_SCHEMA}.facility_deleted_archive a
-    """
-            union_parts.append(archive_part)
-
-        if not union_parts:
-            log("⚠️ [뷰 생성 스킵] UNION 대상이 없습니다.")
-            cur.execute(f"DROP VIEW IF EXISTS {TARGET_SCHEMA}.facility_total_view CASCADE")
-            return
-
-        # 6. facility_total_view 생성 SQL 실행
+        # 5. facility_total_view 생성 SQL 실행
         union_all_sql = "\n    UNION ALL\n".join(union_parts)
         create_view_sql = f"""
 CREATE OR REPLACE VIEW {TARGET_SCHEMA}.facility_total_view AS
@@ -573,9 +508,7 @@ CREATE OR REPLACE VIEW {TARGET_SCHEMA}.facility_total_view AS
 """
         cur.execute(f"DROP VIEW IF EXISTS {TARGET_SCHEMA}.facility_total_view CASCADE")
         cur.execute(create_view_sql)
-        log(f"✅ [facility_total_view 갱신 완료] 물리 테이블 {len(valid_tables)}개"
-            f" + 아카이브 {'포함' if archive_exists else '미포함'}"
-            f" 통합됨 (total_id: FACIL_T{{idx}}_{{own_id}} / FACIL_ARCH_{{id}}, idx는 영구 고정)")
+        log(f"✅ [facility_total_view 갱신 완료] 총 {len(valid_tables)}개 물리 테이블 통합됨 (total_id: FACIL_T{{idx}}_{{own_id}})")
 
     except Exception as e:
         log(f"❌ [facility_total_view 갱신 실패]: {e}")
@@ -828,18 +761,12 @@ def get_all_projects_from_db():
 
 def cleanup_deleted_projects(current_project_ids):
     """
-    QFieldCloud에 실제 등록된 프로젝트 목록과 물리 테이블명(short_id)을 직접 비교하여
-    현재 클라우드에 존재하지 않는(=삭제된) 프로젝트에 속한 테이블만 정리한다.
-    (테이블 내부 데이터가 아니라 테이블명 자체의 short_id로 판단하므로,
-     행이 0건이거나 이미 전부 use_yn='n'인 경우에도 누락 없이 감지된다)
-    1) 대상 테이블 데이터를 facility_deleted_archive로 이관(use_yn='n') 후 원본 테이블 DROP
+    QFieldCloud에서 삭제된 프로젝트 정리
+    1) DB 물리 테이블의 use_yn='n' 소프트 삭제
     2) 로컬 디렉토리 캐시 삭제
     """
     if not current_project_ids:
         return False
-
-    # 테이블명에 박혀있는 short_id(project_id[:13], 하이픈 포함)와 비교하기 위한 집합
-    current_short_ids = {pid[:13] for pid in current_project_ids}
 
     conn = None
     deleted_any = False
@@ -850,20 +777,37 @@ def cleanup_deleted_projects(current_project_ids):
 
         cur.execute("""
             SELECT table_name FROM information_schema.tables
-            WHERE table_schema = %s AND table_type = 'BASE TABLE'
-              AND table_name NOT IN %s
-        """, (TARGET_SCHEMA, SYSTEM_TABLES))
+            WHERE table_schema = %s AND table_type = 'BASE TABLE' AND table_name != 'qfield_info'
+        """, (TARGET_SCHEMA,))
         tables = [r[0] for r in cur.fetchall()]
 
         for t_name in tables:
-            # 테이블명 안에 현재 클라우드에 존재하는 프로젝트의 short_id가 포함되어 있으면 유지
-            if any(short_id in t_name for short_id in current_short_ids):
+            cur.execute("""
+                SELECT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = %s AND table_name = %s AND column_name = 'project_id'
+                )
+            """, (TARGET_SCHEMA, t_name))
+
+            if not cur.fetchone()[0]:
                 continue
 
-            # 현재 클라우드의 어떤 프로젝트와도 매칭되지 않음 -> 삭제된 프로젝트의 잔여 테이블로 판단
-            log(f"🔎 [삭제 프로젝트 테이블 감지] {t_name} (클라우드 등록 프로젝트와 매칭되는 short_id 없음)")
-            archive_and_drop_table(t_name, TARGET_SCHEMA)
-            deleted_any = True
+            cur.execute(f"""
+                SELECT DISTINCT project_id FROM {TARGET_SCHEMA}."{t_name}"
+                WHERE use_yn = 'y' AND project_id IS NOT NULL LIMIT 1
+            """)
+            row = cur.fetchone()
+
+            if row:
+                tbl_pid = row[0]
+                if tbl_pid not in current_project_ids:
+                    cur.execute(f"""
+                        UPDATE {TARGET_SCHEMA}."{t_name}"
+                        SET use_yn = 'n', update_at = NOW()
+                        WHERE use_yn = 'y'
+                    """)
+                    log(f"🧹 [소프트 삭제 완료] 테이블: {t_name} (프로젝트 ID: {tbl_pid})")
+                    deleted_any = True
 
         if os.path.exists(BASE_OUTPUT_DIR):
             local_dirs = [d for d in os.listdir(BASE_OUTPUT_DIR) if os.path.isdir(os.path.join(BASE_OUTPUT_DIR, d))]
@@ -880,171 +824,6 @@ def cleanup_deleted_projects(current_project_ids):
             conn.close()
 
     return deleted_any
-
-
-def ensure_table_idx_registry(cur, table_names):
-    """
-    각 물리 테이블에 영구적이고 고유한 idx를 부여/조회한다.
-    - table_seq_registry에 한 번 등록된 idx는 테이블이 DROP되어도 절대 재사용되지 않는다.
-    - 이를 통해 total_seq/total_id가 테이블 추가/삭제와 무관하게 항상 안정적으로 유지된다.
-    """
-    cur.execute(f"""
-        CREATE TABLE IF NOT EXISTS {TARGET_SCHEMA}.table_seq_registry (
-            table_name TEXT PRIMARY KEY,
-            table_idx BIGSERIAL UNIQUE,
-            reg_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    table_names = list(table_names)
-    if table_names:
-        execute_values(
-            cur,
-            f"""
-            INSERT INTO {TARGET_SCHEMA}.table_seq_registry (table_name)
-            VALUES %s
-            ON CONFLICT (table_name) DO NOTHING
-            """,
-            [(t,) for t in table_names],
-        )
-
-    cur.execute(f"""
-        SELECT table_name, table_idx FROM {TARGET_SCHEMA}.table_seq_registry
-        WHERE table_name = ANY(%s)
-    """, (table_names,))
-    return {r[0]: r[1] for r in cur.fetchall()}
-
-
-def archive_and_drop_table(table_name, schema):
-    """
-    물리 테이블의 모든 데이터를 facility_deleted_archive로 이관(use_yn='n')한 뒤
-    원본 물리 테이블 자체는 DROP 하여 정리한다.
-    (레이어마다 컬럼 구조가 달라서 커스텀 속성은 JSONB(attrs)로 통합 저장)
-
-    ⚠️ 삭제 전/후로 total_seq, total_id가 절대 바뀌지 않도록,
-       이관 시점에 table_seq_registry의 idx + own_id로 "원래 값"을 그대로 계산해서
-       orig_total_seq / orig_total_id 컬럼에 고정 저장한다.
-       (뷰는 이 값을 그대로 사용하므로 삭제 후에도 total_seq/total_id가 유지됨)
-    """
-    conn = None
-    try:
-        conn = get_data_conn()
-        cur = conn.cursor()
-
-        # 0. 아카이브 테이블 보장 (+ 원본 total_seq/total_id 보존 컬럼)
-        cur.execute(f"""
-            CREATE TABLE IF NOT EXISTS {schema}.facility_deleted_archive (
-                id BIGSERIAL PRIMARY KEY,
-                own_id BIGINT,
-                src_key TEXT,
-                source_table TEXT,
-                project_id TEXT,
-                project_name TEXT,
-                owner TEXT,
-                attrs JSONB,
-                use_yn CHAR(1) DEFAULT 'n',
-                reg_date TIMESTAMP,
-                update_at TIMESTAMP,
-                deleted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                geom GEOMETRY,
-                orig_total_seq BIGINT,
-                orig_total_id TEXT
-            )
-        """)
-        # 기존에 이미 생성돼있던 archive 테이블에도 신규 컬럼 보강
-        cur.execute(f"""
-            ALTER TABLE {schema}.facility_deleted_archive
-            ADD COLUMN IF NOT EXISTS orig_total_seq BIGINT
-        """)
-        cur.execute(f"""
-            ALTER TABLE {schema}.facility_deleted_archive
-            ADD COLUMN IF NOT EXISTS orig_total_id TEXT
-        """)
-        cur.execute(f"""
-            CREATE INDEX IF NOT EXISTS idx_facility_deleted_archive_srctable
-            ON {schema}.facility_deleted_archive (source_table)
-        """)
-        conn.commit()
-
-        # 1. 대상 테이블 컬럼 구조 조회
-        cur.execute("""
-            SELECT column_name, udt_name FROM information_schema.columns
-            WHERE table_schema = %s AND table_name = %s
-        """, (schema, table_name))
-        col_rows = cur.fetchall()
-        if not col_rows:
-            return  # 이미 없는 테이블
-
-        cols_lower_map = {r[0].lower(): r[0] for r in col_rows}
-        udt_map = {r[0]: r[1] for r in col_rows}
-
-        geom_col = next((c for c, u in udt_map.items() if u == "geometry"), None)
-        project_id_col = cols_lower_map.get("project_id")
-        project_name_col = cols_lower_map.get("project_name")
-        owner_col = cols_lower_map.get("owner")
-
-        system_cols = {"own_id", "src_key", "use_yn", "reg_date", "update_at"}
-        if geom_col:
-            system_cols.add(geom_col.lower())
-        exclude_orig = {project_id_col, project_name_col, owner_col}
-
-        attrs_cols = [
-            orig for lower, orig in cols_lower_map.items()
-            if lower not in system_cols and orig not in exclude_orig
-        ]
-
-        own_id_expr = 't."own_id"' if "own_id" in cols_lower_map else "NULL"
-        src_key_expr = 't."src_key"' if "src_key" in cols_lower_map else "NULL"
-        reg_date_expr = 't."reg_date"' if "reg_date" in cols_lower_map else "NULL"
-        update_at_expr = 't."update_at"' if "update_at" in cols_lower_map else "NULL"
-        geom_expr = f't."{geom_col}"' if geom_col else "NULL"
-        project_id_expr = f't."{project_id_col}"' if project_id_col else "NULL"
-        project_name_expr = f't."{project_name_col}"' if project_name_col else "NULL"
-        owner_expr = f't."{owner_col}"' if owner_col else "NULL"
-
-        json_build = ", ".join(f"'{c}', t.\"{c}\"" for c in attrs_cols)
-        attrs_expr = f"jsonb_build_object({json_build})" if attrs_cols else "'{}'::jsonb"
-
-        # 1-1. 이관 직전 시점의 total_seq/total_id를 그대로 재현하기 위해
-        #      이 테이블의 registry idx를 조회(없으면 새로 발급)
-        table_idx_map = ensure_table_idx_registry(cur, [table_name])
-        idx = table_idx_map.get(table_name)
-        own_id_col = cols_lower_map.get("own_id")
-
-        if idx is not None and own_id_col:
-            orig_total_seq_expr = f'({idx * 10000000} + t."{own_id_col}")::BIGINT'
-            orig_total_id_expr = f"'FACIL_T{idx}_' || t.\"{own_id_col}\"::TEXT"
-        else:
-            orig_total_seq_expr = "NULL::BIGINT"
-            orig_total_id_expr = "NULL::TEXT"
-
-        # 2. 데이터 이관 (INSERT ... SELECT)
-        insert_sql = f"""
-            INSERT INTO {schema}.facility_deleted_archive
-                (own_id, src_key, source_table, project_id, project_name, owner,
-                 attrs, use_yn, reg_date, update_at, geom, orig_total_seq, orig_total_id)
-            SELECT
-                {own_id_expr}, {src_key_expr}, %s, {project_id_expr}, {project_name_expr}, {owner_expr},
-                {attrs_expr}, 'n', {reg_date_expr}, {update_at_expr}, {geom_expr},
-                {orig_total_seq_expr}, {orig_total_id_expr}
-            FROM {schema}."{table_name}" t
-        """
-        cur.execute(insert_sql, (table_name,))
-        archived_count = cur.rowcount
-        conn.commit()
-
-        # 3. 원본 물리 테이블 DROP
-        cur.execute(f'DROP TABLE IF EXISTS {schema}."{table_name}" CASCADE')
-        conn.commit()
-        log(f"🗄️ [아카이브+DROP 완료] {table_name}: {archived_count}건 이관 후 테이블 삭제 (total_seq/total_id 유지)")
-
-    except Exception as e:
-        if conn:
-            conn.rollback()
-        log(f"⚠️ [아카이브/DROP 실패] {table_name}: {e}")
-    finally:
-        if conn:
-            conn.close()
 
 
 # ============================================================
