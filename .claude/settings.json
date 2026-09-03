@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/py_compile_check.sh",
+            "statusMessage": "python -m py_compile로 문법 검증 중..."
+          }
+        ]
+      }
+    ]
+  }
+}
