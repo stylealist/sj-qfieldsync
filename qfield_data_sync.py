@@ -30,11 +30,16 @@ from sqlalchemy import URL, create_engine, text
 from qfieldcloud_sdk import sdk
 
 # STT(음성 -> 텍스트) 모듈
+# ImportError 뿐 아니라 의존 라이브러리 초기화 실패도 잡아야 원인을 알 수 있다.
 try:
     import disaster2convert as dc
-except ImportError:
+except Exception as _stt_import_error:
     dc = None
-    print("⚠️ disaster2convert 모듈을 찾을 수 없습니다. STT 기능이 비활성화됩니다.", flush=True)
+    print(f"⚠️ STT 모듈 로드 실패({type(_stt_import_error).__name__}): {_stt_import_error}. "
+          f"음성 텍스트 변환이 비활성화됩니다.", flush=True)
+
+# STT 대상 오디오 확장자 (이 확장자를 가진 파일 값일 때만 변환을 시도한다)
+AUDIO_EXTENSIONS = (".m4a", ".wav", ".mp3", ".aac", ".ogg", ".amr", ".3gp")
 
 
 # ============================================================
@@ -109,6 +114,35 @@ def login_client():
 
 
 client = login_client()
+
+
+def _is_audio_column(column_name: str, gdf) -> bool:
+    """
+    이 컬럼이 오디오 첨부 컬럼인지 판단한다.
+    이름 규칙(record/audio/memo)만으로는 텍스트 입력 필드까지 잡히므로,
+    실제 값 중 하나라도 오디오 확장자를 가리키면 오디오 컬럼으로 본다.
+    값이 모두 비어 있는 경우에는 이름에 audio/record 가 있을 때만 인정한다.
+    """
+    lowered = column_name.lower()
+    if not ("record" in lowered or "audio" in lowered or "memo" in lowered):
+        return False
+
+    try:
+        values = gdf[column_name].dropna()
+    except Exception:
+        values = []
+
+    has_value = False
+    for value in values:
+        text = str(value).strip().lower()
+        if not text:
+            continue
+        has_value = True
+        if text.endswith(AUDIO_EXTENSIONS):
+            return True
+
+    # 값이 하나도 없으면 이름으로 판단 (첫 동기화 시 컬럼을 만들어 두기 위함)
+    return not has_value and ("audio" in lowered or "record" in lowered)
 
 
 def build_audio_cache(project_path):
@@ -233,10 +267,13 @@ def save_gdf_direct(gdf, table_name, schema, project_path, allowed_columns=None)
                 reserved_cols.add(geom_col.lower())
             source_cols = [c for c in gdf.columns if c.lower() not in reserved_cols]
 
+        # 음성 첨부 컬럼에는 STT 결과를 담을 <컬럼>_txt 를 함께 만든다.
+        # 이름에 memo 가 들어가도 facility_memo 처럼 텍스트 입력 필드가 있어,
+        # 실제 값이 오디오 파일 경로인 컬럼만 대상으로 삼는다(빈 _txt 컬럼 양산 방지).
         final_cols = []
         for c in source_cols:
             final_cols.append(c)
-            if "record" in c.lower() or "audio" in c.lower() or "memo" in c.lower():
+            if _is_audio_column(c, gdf):
                 final_cols.append(c + "_txt")
 
         date_cols = {c for c in final_cols if "date" in c.lower() or "time" in c.lower() or "at" in c.lower()}
@@ -339,13 +376,27 @@ def save_gdf_direct(gdf, table_name, schema, project_path, allowed_columns=None)
                     origin = col[:-4]
                     file = row_dict.get(origin)
                     stt_val = ""
-                    if isinstance(file, str) and file.strip() and dc:
-                        path = audio_cache.get(os.path.basename(file))
-                        if path:
-                            try:
-                                stt_val = dc.read_audio(path)
-                            except Exception:
-                                pass
+
+                    if isinstance(file, str) and file.strip():
+                        if not dc:
+                            log(f"⚠️ STT 건너뜀(모듈 없음): {table_name}.{origin}={file}")
+                        else:
+                            path = audio_cache.get(os.path.basename(file))
+                            if not path:
+                                # 다운로드된 프로젝트 폴더에 파일이 없을 때 (부분 다운로드 등)
+                                log(f"⚠️ STT 건너뜀(파일 없음): {table_name}.{origin}={file}")
+                            else:
+                                try:
+                                    stt_val = dc.read_audio(path)
+                                    if stt_val:
+                                        log(f"🗣️ STT 성공: {os.path.basename(path)} → {len(stt_val)}자")
+                                    else:
+                                        # 인식 결과가 비어 있는 경우(무음·인식 실패·API 오류)
+                                        log(f"⚠️ STT 결과 없음: {os.path.basename(path)}")
+                                except Exception as e:
+                                    # 조용히 삼키면 원인을 추적할 수 없다
+                                    log(f"❌ STT 실패({type(e).__name__}): {os.path.basename(path)} - {e}")
+
                     values.append(stt_val)
                 elif col in date_cols:
                     values.append(_parse_timestamp(row_dict.get(col)))
