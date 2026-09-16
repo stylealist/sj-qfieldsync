@@ -86,3 +86,7 @@ QFieldCloud에서 프로젝트가 삭제되면 `cleanup_deleted_projects()`가 �
 ### SQL 문자열 조합 시 주의
 
 스키마/테이블/컬럼명은 파라미터 바인딩이 불가능해 f-string으로 직접 SQL에 삽입한다(`schema`, `table_name`, GPKG에서 유래한 컬럼명 등). 값(데이터)은 항상 `%s` 플레이스홀더로 바인딩한다. 새 컬럼/테이블명을 조합하는 코드를 추가할 때는 `_slugify_table_part()` 같은 화이트리스트 정규화를 거치지 않은 외부 입력을 SQL에 직접 넣지 않도록 주의한다.
+
+## 통합 허브
+
+저장소를 넘나드는 작업(현장조사 앱 → 동기화 → DB → 백엔드 → 게이트웨이 → 프론트엔드 → 배포)의 총괄 기준 저장소는 `C:\developer\workspace\mapservice-rest`입니다. 시스템 전체 구조·API 계약·배포 경로는 그 저장소의 `docs/system-architecture.md`, 로컬 포트·기동 순서·CORS는 `docs/dev-environment.md`에 있고, MCP(GitHub/DB)와 로컬 비밀값도 그 저장소에서만 관리합니다.
