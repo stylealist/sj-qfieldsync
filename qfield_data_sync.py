@@ -70,8 +70,12 @@ DATA_DB = dict(
 )
 
 # --- 로컬 다운로드 경로 ---
-ENV = os.getenv("FLASK_ENV", "local")
-BASE_OUTPUT_DIR = "D:/work/qfield" if ENV == "local" else "/app/webfiles/qfield"
+# 배포 차트는 APP_ENV 를 주는데 코드가 FLASK_ENV 만 보고 있어 운영에서도 local 경로를 쓰고 있었다.
+# 둘 다 인정하고, 다운로드 경로는 환경변수로 덮어쓸 수 있게 한다.
+# 기본 운영 경로는 차트가 볼륨을 붙이는 /app/qfield 와 맞춘다(그래야 컨테이너 레이어가 아닌 볼륨에 쌓인다).
+ENV = os.getenv("APP_ENV") or os.getenv("FLASK_ENV", "local")
+DEFAULT_OUTPUT_DIR = "D:/work/qfield" if ENV == "local" else "/app/qfield"
+BASE_OUTPUT_DIR = os.getenv("QFIELD_DOWNLOAD_DIR", DEFAULT_OUTPUT_DIR)
 os.makedirs(BASE_OUTPUT_DIR, exist_ok=True)
 
 # --- 데이터 적재 대상 스키마 ---
@@ -350,9 +354,23 @@ def save_gdf_direct(gdf, table_name, schema, project_path, allowed_columns=None)
                 placeholders.append("%s")
 
         quoted_insert_cols = ", ".join(f'"{c}"' for c in insert_cols)
-        update_set = ", ".join(
-            f'"{c}" = EXCLUDED."{c}"' for c in insert_cols if c != "src_key"
-        )
+
+        # STT 결과(_txt)는 변환에 실패하면 빈 문자열이 된다.
+        # 그대로 덮어쓰면 이전에 성공해 저장된 텍스트가 지워지므로,
+        # 이번 결과가 비어 있으면 기존 값을 유지한다.
+        # (예: 운영 컨테이너에서 STT 가 실패해도 이미 들어간 텍스트는 보존)
+        update_assignments = []
+        for c in insert_cols:
+            if c == "src_key":
+                continue
+            if c.endswith("_txt"):
+                update_assignments.append(
+                    f'"{c}" = COALESCE(NULLIF(EXCLUDED."{c}", \'\'), {schema}."{table_name}"."{c}")'
+                )
+            else:
+                update_assignments.append(f'"{c}" = EXCLUDED."{c}"')
+
+        update_set = ", ".join(update_assignments)
         update_set += ', "update_at" = NOW()'
 
         sql = (
@@ -1102,9 +1120,34 @@ def archive_and_drop_table(table_name, schema):
 # 7. 메인 루프
 # ============================================================
 
+def log_startup_environment():
+    """
+    기동 직후 STT 관련 환경을 한 번 찍는다.
+    운영에서만 음성 텍스트가 비는 문제를 파드 로그만 보고 좁히기 위한 것.
+    """
+    log(f"⚙️ ENV={ENV} / 다운로드 경로={BASE_OUTPUT_DIR}")
+
+    if not dc:
+        log("⚙️ STT: 모듈 없음 — 음성 텍스트 변환이 비활성화 상태")
+        return
+
+    ffmpeg_path = shutil.which("ffmpeg")
+    log(f"⚙️ STT: 모듈 로드됨 / ffmpeg={'있음 (' + ffmpeg_path + ')' if ffmpeg_path else '없음 ← m4a 변환 실패 원인'}")
+
+    # 구글 STT 는 외부 네트워크가 필요하다. 막혀 있으면 변환이 항상 빈 값이 된다.
+    try:
+        import socket
+
+        socket.create_connection(("www.google.com", 443), timeout=5).close()
+        log("⚙️ STT: 외부 네트워크 연결 확인")
+    except Exception as e:
+        log(f"⚙️ STT: 외부 네트워크 연결 실패({type(e).__name__}: {e}) ← 구글 STT 호출 불가")
+
+
 def main():
     last_jobs_cache = {}
     log("🚀 실시간 동기화 엔진 가동 중...")
+    log_startup_environment()
 
     while True:
         try:
